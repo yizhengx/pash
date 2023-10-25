@@ -1,0 +1,11 @@
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "SQSAccess",
+			"Effect": "Allow",
+			"Action": "sqs:SendMessage",
+			"Resource": "arn:aws:sqs:us-east-1:347768412644:queue"
+		}
+	]
+}
