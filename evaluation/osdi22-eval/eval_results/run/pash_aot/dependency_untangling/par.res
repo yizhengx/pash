@@ -5,7 +5,7 @@ MediaConv2.sh:                279.570
 Program_Inference.sh:         712.542
 LogAnalysis1.sh:              377.910
 LogAnalysis2.sh:              2068.278
-Genomics_Computation.sh:      1.873
+Genomics_Computation.sh:      380.498
 AurPkg.sh:                    124.638
 FileEnc1.sh:                  625.995
 FileEnc2.sh:                  80.538
