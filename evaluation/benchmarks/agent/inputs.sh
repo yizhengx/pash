@@ -135,10 +135,103 @@ gen_intrusion() {
     echo "[intrusion] done: $NFILES objects; manifest intrusion.txt"
 }
 
-WHICH=${1:?usage: $0 <log-summary|intrusion|all>}
+# ---------------------------------------------------------------------------
+# access-logs: Apache/combined access logs (IP - - [date] "METHOD /url HTTP/1.1"
+# status size).  Field positions match the task: $1=IP, $7=url, $9=status.
+# Generated under inputs/access/, uploaded, manifest access.txt.
+#   NFILES=8 SIZE_MB=100
+# ---------------------------------------------------------------------------
+gen_accesslog() {
+    local NFILES=${NFILES:-8} SIZE_MB=${SIZE_MB:-100} AVG_LINE=90
+    local LINES=${LINES:-$(( SIZE_MB * 1024 * 1024 / AVG_LINE ))}
+    local DIR="inputs/access" S3_PREFIX="$S3_BASE/access"
+    mkdir -p "$DIR"
+
+    local gen_awk='
+    BEGIN {
+        nu=split("/ /index.html /login /logout /cart /checkout /profile /search /api/items /api/orders /css/style.css /js/app.js /images/banner.jpg /health /admin /missing-page /old-link", U, " ");
+        nm=split("GET GET GET GET POST POST PUT DELETE", M, " ");
+        ns=split("200 200 200 200 200 301 302 404 404 500", S, " ");
+        state=(SEED*1103515245+12345)%2147483648;
+        for (i=0;i<N;i++){
+            state=(state*1103515245+12345)%2147483648; a=state%256;
+            state=(state*1103515245+12345)%2147483648; b=state%256;
+            state=(state*1103515245+12345)%2147483648; c=state%256;
+            state=(state*1103515245+12345)%2147483648; d=state%256;
+            state=(state*1103515245+12345)%2147483648; mth=M[(state%nm)+1];
+            state=(state*1103515245+12345)%2147483648; url=U[(state%nu)+1];
+            state=(state*1103515245+12345)%2147483648; st=S[(state%ns)+1];
+            state=(state*1103515245+12345)%2147483648; sz=(state%9000)+100;
+            state=(state*1103515245+12345)%2147483648; hh=state%24;
+            printf "%d.%d.%d.%d - - [15/Nov/2024:%02d:00:00 +0000] \"%s %s HTTP/1.1\" %s %d\n", a,b,c,d, hh, mth, url, st, sz;
+        }
+    }'
+
+    local i nm
+    : > access.txt
+    echo "[access] generating $NFILES files (~${SIZE_MB}MB / $LINES lines each)..."
+    for i in $(seq 1 "$NFILES"); do
+        printf -v nm "access_%03d.log" "$i"
+        awk -v SEED="$i" -v N="$LINES" "$gen_awk" > "$DIR/$nm"
+        echo "$nm" >> access.txt
+    done
+    echo "[access] uploading to s3://$AWS_BUCKET/$S3_PREFIX/ ..."
+    aws s3 sync "$DIR/" "s3://$AWS_BUCKET/$S3_PREFIX/" --exclude '*' --include '*.log' --no-progress | tail -1
+    echo "[access] done: $NFILES objects; manifest access.txt"
+}
+
+# ---------------------------------------------------------------------------
+# call-stack: profiler stack-trace logs.  Each trace = a digits-only header line
+# followed by indented "\t in <frame>" lines.  Frames drawn from a fixed pool so
+# top-3-frame call sites repeat (matching the task's grouping).  Generated under
+# inputs/callstack/, uploaded, manifest callstack.txt.
+#   NFILES=8 SIZE_MB=100
+# ---------------------------------------------------------------------------
+gen_callstack() {
+    local NFILES=${NFILES:-8} SIZE_MB=${SIZE_MB:-100} AVG_LINE=95
+    local LINES=${LINES:-$(( SIZE_MB * 1024 * 1024 / AVG_LINE ))}
+    local DIR="inputs/callstack" S3_PREFIX="$S3_BASE/callstack"
+    mkdir -p "$DIR"
+
+    # ~N lines total; ~8 frames per trace.
+    local gen_awk='
+    BEGIN {
+        nf=split("printStack()@CallProfiling.cpp:322:3|llvm::cl::Option::addArgument()@CommandLine.cpp:448:17|llvm::MallocAllocator::Allocate()@AllocatorBase.h:85:12|llvm::StringRef::strLen()@StringRef.h:86:14|llvm::allocate_buffer()@MemAlloc.cpp:15:10|llvm::raw_ostream::operator<<()@raw_ostream.h:218:14|llvm::StringMap::insert()@StringMap.h:297:12|llvm::opt::OptTable::getOption()@OptTable.cpp|std::string::append()@basic_string.h:1225:9|llvm::cl::OptionCategory::registerCategory()@CommandLine.cpp:482:3", FR, "|");
+        base="/usr/local/server/home/user1/llvm-project/";
+        state=(SEED*1103515245+12345)%2147483648;
+        printed=0;
+        while (printed < N) {
+            state=(state*1103515245+12345)%2147483648; hdr=(state%900)+1;
+            print hdr; printed++;
+            state=(state*1103515245+12345)%2147483648; depth=(state%8)+4;   # 4..11 frames
+            for (j=0;j<depth && printed<N;j++){
+                state=(state*1103515245+12345)%2147483648; fx=(state%nf)+1;
+                split(FR[fx], p, "@");
+                printf "\t in %s %s%s\n", p[1], base, p[2];
+                printed++;
+            }
+        }
+    }'
+
+    local i nm
+    : > callstack.txt
+    echo "[callstack] generating $NFILES files (~${SIZE_MB}MB / ~$LINES lines each)..."
+    for i in $(seq 1 "$NFILES"); do
+        printf -v nm "trace_%03d.stack" "$i"
+        awk -v SEED="$i" -v N="$LINES" "$gen_awk" > "$DIR/$nm"
+        echo "$nm" >> callstack.txt
+    done
+    echo "[callstack] uploading to s3://$AWS_BUCKET/$S3_PREFIX/ ..."
+    aws s3 sync "$DIR/" "s3://$AWS_BUCKET/$S3_PREFIX/" --exclude '*' --include '*.stack' --no-progress | tail -1
+    echo "[callstack] done: $NFILES objects; manifest callstack.txt"
+}
+
+WHICH=${1:?usage: $0 <log-summary|intrusion|access|callstack|all>}
 case "$WHICH" in
     log-summary) gen_log_summary ;;
     intrusion)   gen_intrusion ;;
-    all)         gen_log_summary; gen_intrusion ;;
-    *) echo "unknown dataset: $WHICH (use log-summary|intrusion|all)"; exit 2 ;;
+    access)      gen_accesslog ;;
+    callstack)   gen_callstack ;;
+    all)         gen_log_summary; gen_intrusion; gen_accesslog; gen_callstack ;;
+    *) echo "unknown dataset: $WHICH (use log-summary|intrusion|access|callstack|all)"; exit 2 ;;
 esac
