@@ -1,0 +1,8 @@
+sensor001.log
+sensor002.log
+sensor003.log
+sensor004.log
+sensor005.log
+sensor006.log
+sensor007.log
+sensor008.log

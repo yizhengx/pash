@@ -1,68 +1,144 @@
 #!/bin/bash
+# Input preparation for the `agent` benchmark. One dataset per benchmark script,
+# each wrapped in its own function; both write a manifest and upload to S3.
+#
+#   ./inputs.sh log-summary     # terminal-bench-log-summary.sh  -> inputs/logs/,  logs.txt
+#   ./inputs.sh intrusion       # terminal-bench-intrusion-*.sh  -> inputs/intrusion/, intrusion.txt
+#   ./inputs.sh all             # both
+#
+# S3 layout (read by the serverless runs):  s3://$AWS_BUCKET/agent/inputs/<dataset>/
 set -u
 cd "$(dirname "$0")" || exit 1
 : "${PASH_TOP:?PASH_TOP not set}"
 : "${AWS_BUCKET:?AWS_BUCKET not set}"
+S3_BASE="agent/inputs"
 
-NBASE=${NBASE:-50}
-NTOTAL=${NTOTAL:-1000}
-SIZE_MB=${SIZE_MB:-100}
-S3_PREFIX="agent/inputs/logs"
-AVG_LINE=64                                   # ~bytes/line, for the line count
-N=$(( SIZE_MB * 1024 * 1024 / AVG_LINE ))
+# ---------------------------------------------------------------------------
+# log-summary: NBASE distinct ~SIZE_MB files generated + uploaded, then fanned
+# out to NTOTAL objects via server-side S3 copies (so 100s of GB never sit on
+# local disk).  Writes logs.txt with all NTOTAL names.
+#   NBASE=50 NTOTAL=1000 SIZE_MB=100
+# ---------------------------------------------------------------------------
+gen_log_summary() {
+    local NBASE=${NBASE:-50} NTOTAL=${NTOTAL:-1000} SIZE_MB=${SIZE_MB:-100}
+    local S3_PREFIX="$S3_BASE/logs" AVG_LINE=64
+    local N=$(( SIZE_MB * 1024 * 1024 / AVG_LINE ))
+    local STAGE; STAGE=$(mktemp -d)
 
-STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
+    local gen_awk='
+    BEGIN {
+        split("ERROR WARNING INFO INFO WARNING INFO ERROR DEBUG INFO WARNING", LV, " "); nlv = 10;
+        msg[0]="Database connection established"; msg[1]="Deadlock detected in transaction ID";
+        msg[2]="Disk space low: remaining"; msg[3]="Scheduled backup completed successfully";
+        msg[4]="API response time exceeded threshold"; msg[5]="User login successful for user";
+        msg[6]="Unhandled exception: TimeoutError"; msg[7]="Cache cleared successfully";
+        msg[8]="High memory usage detected"; msg[9]="Slow query detected: execution time"; nmsg = 10;
+        state = SEED;
+        for (i = 0; i < N; i++) {
+            state=(state*1103515245+12345)%2147483648; hh=int(state/60)%24;
+            state=(state*1103515245+12345)%2147483648; mm=state%60;
+            state=(state*1103515245+12345)%2147483648; ss=state%60;
+            state=(state*1103515245+12345)%2147483648; lv=LV[(state%nlv)+1];
+            state=(state*1103515245+12345)%2147483648; m=msg[state%nmsg];
+            state=(state*1103515245+12345)%2147483648; nnum=state%10000;
+            printf "%s %02d:%02d:%02d [%s] %s %d\n", DATE, hh, mm, ss, lv, m, nnum;
+        }
+    }'
 
-# Deterministic generator (self-contained LCG; identical bytes on any awk).
-gen_awk='
-BEGIN {
-    split("ERROR WARNING INFO INFO WARNING INFO ERROR DEBUG INFO WARNING", LV, " "); nlv = 10;
-    msg[0]="Database connection established"; msg[1]="Deadlock detected in transaction ID";
-    msg[2]="Disk space low: remaining"; msg[3]="Scheduled backup completed successfully";
-    msg[4]="API response time exceeded threshold"; msg[5]="User login successful for user";
-    msg[6]="Unhandled exception: TimeoutError"; msg[7]="Cache cleared successfully";
-    msg[8]="High memory usage detected"; msg[9]="Slow query detected: execution time"; nmsg = 10;
-    state = SEED;
-    for (i = 0; i < N; i++) {
-        state=(state*1103515245+12345)%2147483648; hh=int(state/60)%24;
-        state=(state*1103515245+12345)%2147483648; mm=state%60;
-        state=(state*1103515245+12345)%2147483648; ss=state%60;
-        state=(state*1103515245+12345)%2147483648; lv=LV[(state%nlv)+1];
-        state=(state*1103515245+12345)%2147483648; m=msg[state%nmsg];
-        state=(state*1103515245+12345)%2147483648; nnum=state%10000;
-        printf "%s %02d:%02d:%02d [%s] %s %d\n", DATE, hh, mm, ss, lv, m, nnum;
-    }
-}'
+    local srcs=(api app auth db) names=() i s nm base
+    for i in $(seq 1 "$NTOTAL"); do
+        s=${srcs[$(( (i-1) % 4 ))]}
+        printf -v nm "2025-08-12_%s_%04d.log" "$s" "$i"
+        names+=("$nm")
+    done
+    printf "%s\n" "${names[@]}" > logs.txt
+    echo "[log-summary] wrote logs.txt with ${#names[@]} names"
 
-# Build the NTOTAL target names (valid date prefix so filedate=${f%%_*} works).
-srcs=(api app auth db)
-names=()
-for i in $(seq 1 "$NTOTAL"); do
-    s=${srcs[$(( (i-1) % 4 ))]}
-    printf -v nm "2025-08-12_%s_%04d.log" "$s" "$i"
-    names+=("$nm")
-done
-printf "%s\n" "${names[@]}" > logs.txt
-echo "wrote logs.txt with ${#names[@]} names"
+    echo "[log-summary] generating + uploading $NBASE base files (~${SIZE_MB}MB each, N=$N lines)..."
+    for i in $(seq 0 $((NBASE-1))); do
+        nm="${names[$i]}"
+        awk -v SEED="$((i+1))" -v N="$N" -v DATE="2025-08-12" "$gen_awk" > "$STAGE/$nm"
+        aws s3 cp "$STAGE/$nm" "s3://$AWS_BUCKET/$S3_PREFIX/$nm" --no-progress >/dev/null
+        rm -f "$STAGE/$nm"
+    done
+    echo "[log-summary] creating $((NTOTAL-NBASE)) server-side copies..."
+    for i in $(seq "$NBASE" $((NTOTAL-1))); do
+        nm="${names[$i]}"; base="${names[$(( i % NBASE ))]}"
+        aws s3 cp "s3://$AWS_BUCKET/$S3_PREFIX/$base" "s3://$AWS_BUCKET/$S3_PREFIX/$nm" --no-progress >/dev/null
+        if [ $(( (i+1) % 100 )) -eq 0 ]; then echo "  copied up to $((i+1))/$NTOTAL"; fi
+    done
+    rm -rf "$STAGE"
+    echo "[log-summary] done: $NTOTAL objects under s3://$AWS_BUCKET/$S3_PREFIX/"
+}
 
-# 1+2. Generate + upload the NBASE distinct base files.
-echo "generating + uploading $NBASE base files (~${SIZE_MB}MB each, N=$N lines)..."
-for i in $(seq 0 $((NBASE-1))); do
-    nm="${names[$i]}"
-    awk -v SEED="$((i+1))" -v N="$N" -v DATE="2025-08-12" "$gen_awk" > "$STAGE/$nm"
-    aws s3 cp "$STAGE/$nm" "s3://$AWS_BUCKET/$S3_PREFIX/$nm" --no-progress >/dev/null
-    rm -f "$STAGE/$nm"
-    echo "  [$((i+1))/$NBASE] uploaded $nm"
-done
+# ---------------------------------------------------------------------------
+# intrusion: NFILES mixed auth+http "sensor" logs with attack patterns + source
+# IPs (SSH brute force, web scans, invalid users, sudo commands) + benign noise.
+# Generated locally under inputs/intrusion/, uploaded, manifest intrusion.txt.
+#   NFILES=8 LINES=20000
+# ---------------------------------------------------------------------------
+gen_intrusion() {
+    local NFILES=${NFILES:-8} SIZE_MB=${SIZE_MB:-100} AVG_LINE=88
+    local LINES=${LINES:-$(( SIZE_MB * 1024 * 1024 / AVG_LINE ))}
+    local DIR="inputs/intrusion" S3_PREFIX="$S3_BASE/intrusion"
+    mkdir -p "$DIR"
 
-# 3. Fan out the rest with server-side copies (no data leaves S3).
-echo "creating $((NTOTAL-NBASE)) server-side copies..."
-for i in $(seq "$NBASE" $((NTOTAL-1))); do
-    nm="${names[$i]}"
-    base="${names[$(( i % NBASE ))]}"
-    aws s3 cp "s3://$AWS_BUCKET/$S3_PREFIX/$base" "s3://$AWS_BUCKET/$S3_PREFIX/$nm" --no-progress >/dev/null
-    if [ $(( (i+1) % 100 )) -eq 0 ]; then echo "  copied up to $((i+1))/$NTOTAL"; fi
-done
+    local gen_awk='
+    BEGIN {
+        na=split("45.32.67.89 61.177.172.13 185.220.101.5 103.94.12.7 45.32.67.90", ATK, " ");
+        ni=split("192.168.0.34 10.0.0.44 192.168.3.10 192.168.3.14", INT, " ");
+        nu=split("root admin postgres ubuntu guest test devuser", U, " ");
+        nsp=split("/admin /phpmyadmin /wp-admin /manager/html /.env /config.php", SP, " ");
+        nbp=split("/index.html /images/banner.jpg /documentation /favicon.ico", BP, " ");
+        ncmd=split("/usr/bin/less /usr/bin/vi /bin/cat", CMD, " ");
+        state = (SEED*1103515245 + 12345) % 2147483648;
+        for (i = 0; i < N; i++) {
+            state=(state*1103515245+12345)%2147483648; t=state%10;
+            state=(state*1103515245+12345)%2147483648; dd=(state%28)+1;
+            state=(state*1103515245+12345)%2147483648; hh=state%24;
+            state=(state*1103515245+12345)%2147483648; mm=state%60;
+            state=(state*1103515245+12345)%2147483648; ss=state%60;
+            state=(state*1103515245+12345)%2147483648; pid=(state%9000)+1000;
+            state=(state*1103515245+12345)%2147483648; aip=ATK[(state%na)+1];
+            state=(state*1103515245+12345)%2147483648; iip=INT[(state%ni)+1];
+            state=(state*1103515245+12345)%2147483648; usr=U[(state%nu)+1];
+            state=(state*1103515245+12345)%2147483648; port=(state%40000)+1024;
+            if (t == 0) {
+                printf "Apr %02d %02d:%02d:%02d server sshd[%d]: Failed password for invalid user %s from %s port %d ssh2\n", dd,hh,mm,ss,pid,usr,aip,port;
+            } else if (t < 3) {
+                printf "Apr %02d %02d:%02d:%02d server sshd[%d]: Failed password for %s from %s port %d ssh2\n", dd,hh,mm,ss,pid,usr,aip,port;
+            } else if (t == 3) {
+                state=(state*1103515245+12345)%2147483648; cmd=CMD[(state%ncmd)+1];
+                printf "Apr %02d %02d:%02d:%02d server sudo:  %s : TTY=pts/0 ; PWD=/home/%s ; USER=root ; COMMAND=%s\n", dd,hh,mm,ss,usr,usr,cmd;
+            } else if (t < 6) {
+                state=(state*1103515245+12345)%2147483648; sp=SP[(state%nsp)+1];
+                printf "%s - - [%02d/Apr/2023:%02d:%02d:%02d +0000] GET %s HTTP/1.1 403 512\n", aip,dd,hh,mm,ss,sp;
+            } else if (t < 9) {
+                state=(state*1103515245+12345)%2147483648; bp=BP[(state%nbp)+1];
+                printf "%s - - [%02d/Apr/2023:%02d:%02d:%02d +0000] GET %s HTTP/1.1 200 1024\n", iip,dd,hh,mm,ss,bp;
+            } else {
+                printf "Apr %02d %02d:%02d:%02d server sshd[%d]: Accepted password for %s from %s port %d ssh2\n", dd,hh,mm,ss,pid,usr,iip,port;
+            }
+        }
+    }'
 
-echo "done: $NTOTAL objects ($NBASE distinct, ${SIZE_MB}MB each) under s3://$AWS_BUCKET/$S3_PREFIX/"
+    local i nm
+    : > intrusion.txt
+    echo "[intrusion] generating $NFILES files (~${SIZE_MB}MB / $LINES lines each)..."
+    for i in $(seq 1 "$NFILES"); do
+        printf -v nm "sensor%03d.log" "$i"
+        awk -v SEED="$i" -v N="$LINES" "$gen_awk" > "$DIR/$nm"
+        echo "$nm" >> intrusion.txt
+    done
+    echo "[intrusion] uploading to s3://$AWS_BUCKET/$S3_PREFIX/ ..."
+    aws s3 sync "$DIR/" "s3://$AWS_BUCKET/$S3_PREFIX/" --exclude '*' --include '*.log' --no-progress | tail -1
+    echo "[intrusion] done: $NFILES objects; manifest intrusion.txt"
+}
+
+WHICH=${1:?usage: $0 <log-summary|intrusion|all>}
+case "$WHICH" in
+    log-summary) gen_log_summary ;;
+    intrusion)   gen_intrusion ;;
+    all)         gen_log_summary; gen_intrusion ;;
+    *) echo "unknown dataset: $WHICH (use log-summary|intrusion|all)"; exit 2 ;;
+esac
